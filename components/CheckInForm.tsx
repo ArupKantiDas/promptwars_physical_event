@@ -127,6 +127,8 @@ export function CheckInForm({ eventId }: CheckInFormProps) {
         gateName: result.gateName,
         wait: String(result.estimatedWaitMinutes),
         eventId,
+        userLat: String(latitude),
+        userLng: String(longitude),
       });
       router.push(`/dashboard?${params.toString()}`);
     } catch (err: unknown) {

@@ -111,10 +111,15 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const venueLng = venueData["geofenceLng"] as number;
     const geofenceRadiusMetres = (venueData["geofenceRadiusM"] as number) ?? 200;
 
+    console.log("[checkin] Venue center:", { lat: venueLat, lng: venueLng, radiusM: geofenceRadiusMetres });
+    console.log("[checkin] User location:", { lat: latitude, lng: longitude });
+
     // 2. Geolocation validation — skip when SKIP_GEOFENCE=true (testing only)
     const skipGeofence = process.env["SKIP_GEOFENCE"] === "true";
+    const distanceMetres = haversineMetres(latitude, longitude, venueLat, venueLng);
+    console.log(`[checkin] Distance from venue: ${Math.round(distanceMetres)} m (geofence ${skipGeofence ? "SKIPPED" : `radius ${geofenceRadiusMetres} m`})`);
+
     if (!skipGeofence) {
-      const distanceMetres = haversineMetres(latitude, longitude, venueLat, venueLng);
       if (distanceMetres > geofenceRadiusMetres) {
         return NextResponse.json(
           {

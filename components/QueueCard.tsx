@@ -3,8 +3,9 @@
 /**
  * components/QueueCard.tsx
  *
- * Displays real-time gate queue information for the assigned gate.
- * Subscribes to Firestore real-time updates via the client SDK.
+ * Real-time queue status for the attendee's assigned gate.
+ * Subscribes to Firestore via onSnapshot. Displays a color-coded ring
+ * (green <10 min, amber 10-20 min, red >20 min) with a live countdown.
  */
 
 import { useEffect, useState } from 'react';
@@ -25,18 +26,35 @@ interface QueueCardProps {
   eventId: string;
   gateId: string;
   gateName: string;
-  /** Initial wait estimate from the check-in response (shown until first Firestore update). */
   initialWaitMinutes: number;
+}
+
+// ─── Ring helpers ─────────────────────────────────────────────────────────────
+
+const RADIUS = 80;
+const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
+const MAX_WAIT_MIN = 30;
+
+function ringColor(waitMinutes: number): string {
+  if (waitMinutes < 10) return '#10b981'; // emerald
+  if (waitMinutes < 20) return '#f59e0b'; // amber
+  return '#ef4444';                        // red
+}
+
+function ringOffset(waitMinutes: number): number {
+  const fillPct = Math.min(waitMinutes / MAX_WAIT_MIN, 1);
+  return CIRCUMFERENCE * (1 - fillPct);
+}
+
+function waitTextColor(waitMinutes: number): string {
+  if (waitMinutes < 10) return 'text-emerald-400';
+  if (waitMinutes < 20) return 'text-amber-400';
+  return 'text-red-400';
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export function QueueCard({
-  eventId,
-  gateId,
-  gateName,
-  initialWaitMinutes,
-}: QueueCardProps) {
+export function QueueCard({ eventId, gateId, gateName, initialWaitMinutes }: QueueCardProps) {
   const [gate, setGate] = useState<GateSnapshot | null>(null);
   const [connectionError, setConnectionError] = useState(false);
 
@@ -71,77 +89,130 @@ export function QueueCard({
   }, [eventId, gateId]);
 
   const waitMinutes = gate?.estimatedWaitMinutes ?? initialWaitMinutes;
-  const queueLength = gate?.queueLength ?? '—';
+  const queueLength = gate?.queueLength ?? 0;
   const isActive = gate?.isActive ?? true;
+  const displayName = gate?.name ?? gateName;
 
-  const waitLabel =
-    waitMinutes < 1 ? 'Less than 1 min' : `~${Math.round(waitMinutes)} min`;
-
-  const urgencyColor =
-    waitMinutes <= 5
-      ? 'text-emerald-400'
-      : waitMinutes <= 15
-        ? 'text-amber-400'
-        : 'text-red-400';
+  const waitLabel = waitMinutes < 1 ? '<1' : String(Math.round(waitMinutes));
+  const color = ringColor(waitMinutes);
+  const textColor = waitTextColor(waitMinutes);
 
   return (
-    <article
-      aria-label={`Queue status for ${gateName}`}
-      className="
-        rounded-2xl border border-white/10 bg-white/5 p-6 backdrop-blur-sm
-        shadow-xl shadow-black/20
-      "
-    >
-      <header className="mb-4 flex items-start justify-between gap-4">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-            Your Gate
-          </p>
-          <h2 className="mt-1 text-3xl font-bold text-white">{gateName}</h2>
+    <article aria-label={`Queue status for ${displayName}`} className="space-y-4">
+
+      {/* Ring + core stats */}
+      <div className="flex flex-col items-center gap-4 sm:flex-row sm:items-center sm:gap-8">
+
+        {/* SVG ring */}
+        <div className="relative shrink-0">
+          <svg
+            width="200"
+            height="200"
+            viewBox="0 0 200 200"
+            aria-hidden="true"
+            className="drop-shadow-lg"
+          >
+            {/* Track */}
+            <circle
+              cx="100" cy="100" r={RADIUS}
+              fill="none"
+              stroke="rgba(255,255,255,0.06)"
+              strokeWidth="12"
+            />
+            {/* Fill */}
+            <circle
+              cx="100" cy="100" r={RADIUS}
+              fill="none"
+              stroke={color}
+              strokeWidth="12"
+              strokeLinecap="round"
+              strokeDasharray={CIRCUMFERENCE}
+              strokeDashoffset={ringOffset(waitMinutes)}
+              transform="rotate(-90 100 100)"
+              style={{ transition: 'stroke-dashoffset 0.8s ease, stroke 0.6s ease' }}
+            />
+            {/* Glow */}
+            <circle
+              cx="100" cy="100" r={RADIUS}
+              fill="none"
+              stroke={color}
+              strokeWidth="4"
+              strokeLinecap="round"
+              strokeDasharray={CIRCUMFERENCE}
+              strokeDashoffset={ringOffset(waitMinutes)}
+              transform="rotate(-90 100 100)"
+              opacity="0.25"
+              style={{ filter: 'blur(4px)', transition: 'stroke-dashoffset 0.8s ease' }}
+            />
+          </svg>
+
+          {/* Center content */}
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <span className={`text-5xl font-extrabold tabular-nums leading-none ${textColor}`}>
+              {waitLabel}
+            </span>
+            <span className="mt-1 text-xs font-semibold uppercase tracking-widest text-slate-400">
+              min wait
+            </span>
+          </div>
         </div>
 
-        <span
-          aria-label={isActive ? 'Gate is open' : 'Gate is closed'}
-          className={`
-            mt-1 rounded-full px-3 py-1 text-xs font-semibold
-            ${isActive ? 'bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/30' : 'bg-red-500/15 text-red-400 ring-1 ring-red-500/30'}
-          `}
-        >
-          {isActive ? 'Open' : 'Closed'}
-        </span>
-      </header>
+        {/* Textual stats */}
+        <div className="flex flex-1 flex-col gap-3 text-center sm:text-left">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-widest text-slate-500">
+              Your Gate
+            </p>
+            <p className="mt-0.5 text-4xl font-extrabold text-white">{displayName}</p>
+          </div>
 
-      <dl className="grid grid-cols-2 gap-4">
-        <div className="rounded-xl bg-white/5 p-4">
-          <dt className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-            Wait Time
-          </dt>
-          <dd className={`mt-1 text-2xl font-bold tabular-nums ${urgencyColor}`}>
-            {waitLabel}
-          </dd>
+          <div className="flex items-center justify-center gap-2 sm:justify-start">
+            <span
+              aria-label={isActive ? 'Gate is open' : 'Gate is closed'}
+              className={`
+                rounded-full px-3 py-1 text-xs font-semibold ring-1
+                ${isActive
+                  ? 'bg-emerald-500/15 text-emerald-400 ring-emerald-500/30'
+                  : 'bg-red-500/15 text-red-400 ring-red-500/30'}
+              `}
+            >
+              {isActive ? 'Open' : 'Closed'}
+            </span>
+            {connectionError && (
+              <span className="rounded-full bg-amber-500/15 px-3 py-1 text-xs text-amber-400 ring-1 ring-amber-500/30">
+                Offline
+              </span>
+            )}
+          </div>
+
+          <dl className="grid grid-cols-2 gap-3">
+            <div className="rounded-xl bg-white/5 p-3">
+              <dt className="text-[10px] font-semibold uppercase tracking-widest text-slate-500">
+                In Queue
+              </dt>
+              <dd className="mt-1 text-2xl font-bold tabular-nums text-white">
+                {queueLength}
+              </dd>
+              <dd className="text-[10px] text-slate-500">people ahead</dd>
+            </div>
+            <div className="rounded-xl bg-white/5 p-3">
+              <dt className="text-[10px] font-semibold uppercase tracking-widest text-slate-500">
+                Status
+              </dt>
+              <dd className={`mt-1 text-2xl font-bold ${textColor}`}>
+                {waitMinutes < 10 ? 'Fast' : waitMinutes < 20 ? 'Moderate' : 'Busy'}
+              </dd>
+              <dd className="text-[10px] text-slate-500">current pace</dd>
+            </div>
+          </dl>
         </div>
+      </div>
 
-        <div className="rounded-xl bg-white/5 p-4">
-          <dt className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-            Queue Length
-          </dt>
-          <dd className="mt-1 text-2xl font-bold tabular-nums text-white">
-            {queueLength}
-          </dd>
-        </div>
-      </dl>
-
-      {connectionError && (
-        <p
-          role="alert"
-          className="mt-4 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-400 border border-amber-500/20"
-        >
-          ⚠ Live updates unavailable — showing last known data.
-        </p>
-      )}
-
-      <p className="mt-4 text-xs text-slate-500">
-        Updates in real time · Powered by GateFlow AI
+      {/* Live update notice */}
+      <p className="text-center text-xs text-slate-600">
+        {connectionError
+          ? '⚠ Live updates paused — showing last known data'
+          : '● Updates live · Powered by GateFlow AI'}
       </p>
     </article>
   );
