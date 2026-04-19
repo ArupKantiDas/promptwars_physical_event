@@ -1,0 +1,61 @@
+rules_version = '2';
+
+// GateFlow Firestore Security Rules
+//
+// The server uses the Firebase Admin SDK (bypasses these rules entirely).
+// These rules protect the client SDK used in the browser for real-time listeners.
+//
+// Principle of least privilege:
+//   - Anonymous-authenticated clients may READ gate status for live queue updates.
+//   - Anonymous-authenticated clients may READ public event metadata.
+//   - All writes from the client are denied — mutations go through the server API.
+//   - Ticket documents (contain PII) are inaccessible from the client.
+//   - Everything else is denied by default.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Event documents (name, venueId, schedule) ─────────────────────────────
+    // Readable so the client can display event context if needed.
+    match /events/{eventId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    // ── Gate documents (queueLength, estimatedWaitMinutes, isActive) ──────────
+    // Readable by any signed-in user (including anonymous) for onSnapshot listeners.
+    match /events/{eventId}/gates/{gateId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    // ── Ticket documents (barcode, seatSection, status, userId) ──────────────
+    // Contains PII — never exposed to the client SDK.
+    match /events/{eventId}/tickets/{ticketId} {
+      allow read, write: if false;
+    }
+
+    // ── Trivia documents (fact, category) ────────────────────────────────────
+    // Public read for the AI assistant's getVenueTrivia function (server-side).
+    // Client access not needed; blocked here for defence in depth.
+    match /events/{eventId}/trivia/{triviaId} {
+      allow read, write: if false;
+    }
+
+    // ── Venue documents (geofence coords, name) ───────────────────────────────
+    match /venues/{venueId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    // ── Section documents (zoneMappings) ─────────────────────────────────────
+    match /venues/{venueId}/sections/{sectionId} {
+      allow read, write: if false;
+    }
+
+    // ── Catch-all: deny everything not explicitly permitted ───────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

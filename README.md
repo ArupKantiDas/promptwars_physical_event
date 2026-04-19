@@ -28,7 +28,7 @@ Queue anxiety is mostly an information problem. Research on queue psychology sho
 
 | Service | Role | Why This Service |
 |---------|------|------------------|
-| **Gemini API** (gemini-2.0-flash) | Conversational assistant with function calling | Powers contextual Q&A: "How long is my wait?", "Where do I go?", "Tell me something about the teams." Function calling lets Gemini invoke gate assignment, queue lookups, and directions dynamically. |
+| **Gemini API** (gemini-2.5-flash) | Conversational assistant with function calling | Powers contextual Q&A: "How long is my wait?", "Where do I go?", "Tell me something about the teams." Function calling lets Gemini invoke gate assignment, queue lookups, and directions dynamically. |
 | **Google Maps JavaScript API** | Interactive venue map with gate markers and walking routes | Attendees see their assigned gate on a real map with a walking route from their current location. Directions come from the Maps Directions Service. |
 | **Cloud Firestore** | Real-time queue state database | Firestore's real-time listeners (`onSnapshot`) push queue updates to the client without polling or custom SSE infrastructure. Each gate document holds live queue length and EMA metrics. |
 | **Firebase Authentication** | Anonymous auth for ticket-holder sessions | Provides a secure session identity without requiring account creation. The anonymous UID links to the attendee's ticket for the duration of the event. |
@@ -169,7 +169,7 @@ npm run test:coverage
 - **Framework:** Next.js 15 (App Router)
 - **Language:** TypeScript
 - **Styling:** Tailwind CSS
-- **AI:** Google Gemini 2.0 Flash (function calling)
+- **AI:** Google Gemini 2.5 Flash (function calling)
 - **Maps:** Google Maps JavaScript API
 - **Database:** Cloud Firestore (real-time listeners)
 - **Auth:** Firebase Authentication (anonymous)

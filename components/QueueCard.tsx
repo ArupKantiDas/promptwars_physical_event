@@ -4,8 +4,9 @@
  * components/QueueCard.tsx
  *
  * Real-time queue status for the attendee's assigned gate.
- * Subscribes to Firestore via onSnapshot. Displays a color-coded ring
- * (green <10 min, amber 10-20 min, red >20 min) with a live countdown.
+ * Subscribes to Firestore via onSnapshot. Displays a color+icon+text coded ring
+ * (green+checkmark <10 min, amber+clock 10-20 min, red+warning >20 min)
+ * so status is never communicated by colour alone (WCAG 1.4.1).
  */
 
 import { useEffect, useState } from 'react';
@@ -52,6 +53,14 @@ function waitTextColor(waitMinutes: number): string {
   return 'text-red-400';
 }
 
+// Icon + label pair so status is never communicated by colour alone (WCAG 1.4.1)
+interface PaceInfo { label: string; icon: string; ariaLabel: string }
+function paceInfo(waitMinutes: number): PaceInfo {
+  if (waitMinutes < 10) return { label: 'Fast',     icon: '✓', ariaLabel: 'Fast — under 10 minutes' };
+  if (waitMinutes < 20) return { label: 'Moderate', icon: '◷', ariaLabel: 'Moderate — 10 to 20 minutes' };
+  return                       { label: 'Busy',     icon: '!', ariaLabel: 'Busy — over 20 minutes' };
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function QueueCard({ eventId, gateId, gateName, initialWaitMinutes }: QueueCardProps) {
@@ -96,6 +105,7 @@ export function QueueCard({ eventId, gateId, gateName, initialWaitMinutes }: Que
   const waitLabel = waitMinutes < 1 ? '<1' : String(Math.round(waitMinutes));
   const color = ringColor(waitMinutes);
   const textColor = waitTextColor(waitMinutes);
+  const pace = paceInfo(waitMinutes);
 
   return (
     <article aria-label={`Queue status for ${displayName}`} className="space-y-4">
@@ -146,12 +156,15 @@ export function QueueCard({ eventId, gateId, gateName, initialWaitMinutes }: Que
             />
           </svg>
 
-          {/* Center content */}
-          <div className="absolute inset-0 flex flex-col items-center justify-center">
-            <span className={`text-5xl font-extrabold tabular-nums leading-none ${textColor}`}>
+          {/* Center content — icon + number so status isn't colour-only */}
+          <div className="absolute inset-0 flex flex-col items-center justify-center" aria-label={pace.ariaLabel}>
+            <span aria-hidden="true" className={`text-xl font-black leading-none ${textColor}`}>
+              {pace.icon}
+            </span>
+            <span className={`text-4xl font-extrabold tabular-nums leading-none ${textColor}`}>
               {waitLabel}
             </span>
-            <span className="mt-1 text-xs font-semibold uppercase tracking-widest text-slate-400">
+            <span className="mt-1 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
               min wait
             </span>
           </div>
@@ -195,12 +208,13 @@ export function QueueCard({ eventId, gateId, gateName, initialWaitMinutes }: Que
               </dd>
               <dd className="text-[10px] text-slate-500">people ahead</dd>
             </div>
-            <div className="rounded-xl bg-white/5 p-3">
+            <div className="rounded-xl bg-white/5 p-3" aria-label={pace.ariaLabel}>
               <dt className="text-[10px] font-semibold uppercase tracking-widest text-slate-500">
                 Status
               </dt>
-              <dd className={`mt-1 text-2xl font-bold ${textColor}`}>
-                {waitMinutes < 10 ? 'Fast' : waitMinutes < 20 ? 'Moderate' : 'Busy'}
+              <dd className={`mt-1 flex items-center gap-1.5 text-2xl font-bold ${textColor}`}>
+                <span aria-hidden="true">{pace.icon}</span>
+                {pace.label}
               </dd>
               <dd className="text-[10px] text-slate-500">current pace</dd>
             </div>
