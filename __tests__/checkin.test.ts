@@ -173,7 +173,6 @@ function makeRequest(body: Record<string, unknown>): NextRequest {
 describe('POST /api/checkin', () => {
   beforeEach(() => {
     vi.stubEnv('NEXT_PUBLIC_DEFAULT_EVENT_ID', EVENT_ID);
-    vi.stubEnv('SKIP_GEOFENCE', 'true'); // most tests skip geofence
   });
 
   afterEach(() => {
@@ -184,8 +183,6 @@ describe('POST /api/checkin', () => {
   // ── Requested: 422 outside geofence ───────────────────────────────────────
 
   it('returns 422 when user coordinates are outside the venue geofence', async () => {
-    vi.stubEnv('SKIP_GEOFENCE', 'false'); // enforce geofence for this test
-
     const { db } = buildMockDb();
     vi.mocked(getAdminDb).mockReturnValue(db as ReturnType<typeof getAdminDb>);
 

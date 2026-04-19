@@ -13,6 +13,7 @@ export function RefreshButton() {
     <button
       type="button"
       onClick={() => window.location.reload()}
+      aria-label="Refresh queue status"
       className="
         flex items-center gap-2 rounded-xl border border-white/10 bg-white/5
         px-4 py-3 text-sm font-medium text-slate-300 transition
