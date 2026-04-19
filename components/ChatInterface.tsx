@@ -19,13 +19,15 @@ interface DisplayMessage {
 
 interface ChatInterfaceProps {
   eventId: string;
+  gateId: string;
+  ticketId: string;
   /** Pre-fill the first message (e.g., "Which gate am I assigned to?"). */
   initialMessage?: string;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export function ChatInterface({ eventId, initialMessage }: ChatInterfaceProps) {
+export function ChatInterface({ eventId, gateId, ticketId, initialMessage }: ChatInterfaceProps) {
   const [messages, setMessages] = useState<DisplayMessage[]>([
     {
       role: 'model',
@@ -59,9 +61,9 @@ export function ChatInterface({ eventId, initialMessage }: ChatInterfaceProps) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          eventId,
-          history,
           message: text.trim(),
+          history,
+          context: { eventId, gateId, ticketId },
         }),
       });
 

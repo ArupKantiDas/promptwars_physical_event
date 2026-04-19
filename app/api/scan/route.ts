@@ -3,12 +3,12 @@
  *
  * POST /api/scan
  *
- * Called by gate scanner hardware/staff when an attendee physically passes
- * through a gate. Records entry, updates EMA wait estimates, and decrements
- * the gate queue counter.
+ * Called by gate scanner hardware when an attendee physically passes through.
+ * Resolves the ticket via a collectionGroup query (no eventId in body),
+ * records entry, recalculates the EMA wait estimate, and decrements the queue.
  *
  * Request body:
- *   { eventId: string; gateId: string; barcode: string }
+ *   { barcode: string; checkpointId: string }
  *
  * Response (200):
  *   { ticketId: string; updatedEma: number; estimatedWaitMinutes: number }
@@ -22,12 +22,12 @@ import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { getAdminDb } from "@/lib/firebase";
 import { calculateEMA, estimateWait } from "@/lib/ema";
 
-// ─── Request / Response schemas ───────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface ScanRequestBody {
-  eventId: string;
-  gateId: string;
   barcode: string;
+  /** Physical gate ID at the scanner checkpoint. */
+  checkpointId: string;
 }
 
 interface ScanResponse {
@@ -47,11 +47,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const { eventId, gateId, barcode } = body;
+  const { barcode, checkpointId } = body;
 
-  if (!eventId || !gateId || !barcode) {
+  if (!barcode || !checkpointId) {
     return NextResponse.json(
-      { error: "eventId, gateId, and barcode are required." },
+      { error: "barcode and checkpointId are required." },
       { status: 400 },
     );
   }
@@ -59,9 +59,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   try {
     const db = getAdminDb();
 
-    // 1. Find and validate the ticket
+    // 1. Find ticket across all events via collectionGroup — no eventId in body
     const ticketSnapshot = await db
-      .collection(`events/${eventId}/tickets`)
+      .collectionGroup("tickets")
       .where("barcode", "==", barcode)
       .limit(1)
       .get();
@@ -73,6 +73,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const ticketDoc = ticketSnapshot.docs[0]!;
     const ticketData = ticketDoc.data();
 
+    // Extract eventId from the document path: events/{eventId}/tickets/{ticketId}
+    const pathSegments = ticketDoc.ref.path.split("/");
+    const eventId = pathSegments[1]!;
+
     if (ticketData["status"] === "entered") {
       return NextResponse.json(
         { error: "Ticket already scanned at entry." },
@@ -82,7 +86,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     if (
       ticketData["status"] !== "checked_in" ||
-      ticketData["assignedGateId"] !== gateId
+      ticketData["assignedGateId"] !== checkpointId
     ) {
       return NextResponse.json(
         { error: "Ticket not assigned to this gate." },
@@ -90,8 +94,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // 2. Load the gate to get current EMA and queue length
-    const gateRef = db.doc(`events/${eventId}/gates/${gateId}`);
+    // 2. Load gate document for EMA and scan timestamps
+    const gateRef = db.doc(`events/${eventId}/gates/${checkpointId}`);
     const gateDoc = await gateRef.get();
 
     if (!gateDoc.exists) {
@@ -101,18 +105,18 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const gateData = gateDoc.data()!;
     const previousEma = (gateData["emaSecondsPerEntry"] as number) ?? 30;
     const currentQueueLength = (gateData["queueLength"] as number) ?? 0;
-    const lastUpdatedAt = gateData["lastUpdatedAt"] as Timestamp | undefined;
 
-    // 3. Calculate interval since last scan (seconds)
+    // 3. Compute scan interval from the last two timestamps:
+    //    previousScanAt (the scan before last) and lastScanAt (most recent scan).
+    //    On the very first scan there is no lastScanAt, so we default to 30 s ago.
+    const lastScanAt = gateData["lastScanAt"] as Timestamp | undefined;
     const nowMs = Date.now();
-    const lastUpdatedMs = lastUpdatedAt ? lastUpdatedAt.toMillis() : nowMs - 30_000;
-    const latestInterval = (nowMs - lastUpdatedMs) / 1000;
+    const lastScanMs = lastScanAt ? lastScanAt.toMillis() : nowMs - 30_000;
+    const latestIntervalSeconds = (nowMs - lastScanMs) / 1000;
 
-    // Queue position for the scanned attendee (they are at the front)
+    // 4. Update EMA and estimate remaining wait for the people still in queue
     const queuePosition = Math.max(0, currentQueueLength - 1);
-
-    // 4. Update EMA and estimate wait
-    const updatedEma = calculateEMA(previousEma, latestInterval);
+    const updatedEma = calculateEMA(previousEma, latestIntervalSeconds);
     const estimatedWaitMinutes = estimateWait(queuePosition, updatedEma);
 
     // 5. Atomically update ticket status and gate stats
@@ -127,6 +131,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       queueLength: FieldValue.increment(-1),
       emaSecondsPerEntry: updatedEma,
       estimatedWaitMinutes,
+      // Rotate timestamps: previous ← last ← now
+      previousScanAt: lastScanAt ?? FieldValue.serverTimestamp(),
+      lastScanAt: FieldValue.serverTimestamp(),
       lastUpdatedAt: FieldValue.serverTimestamp(),
     });
 
@@ -135,8 +142,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const response: ScanResponse = { ticketId: ticketDoc.id, updatedEma, estimatedWaitMinutes };
     return NextResponse.json(response, { status: 200 });
   } catch (error: unknown) {
-    const message =
-      error instanceof Error ? error.message : "Internal server error.";
+    const message = error instanceof Error ? error.message : "Internal server error.";
     console.error("[/api/scan] Error:", error);
     return NextResponse.json({ error: message }, { status: 500 });
   }

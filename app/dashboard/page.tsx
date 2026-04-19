@@ -143,6 +143,8 @@ export default async function DashboardPage({ searchParams }: PageProps) {
           <div className="min-h-[420px] flex-1 lg:min-h-[500px]">
             <ChatInterface
               eventId={eventId}
+              gateId={gateId}
+              ticketId={ticketId ?? ''}
               initialMessage={`I'm assigned to ${gateName}. What's the current wait?`}
             />
           </div>

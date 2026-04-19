@@ -3,7 +3,7 @@
  *
  * Gemini API client setup and function declarations for the GateFlow assistant.
  *
- * The chat route sends user messages to Gemini with the function declarations
+ * The chat route sends user messages to Gemini with the four tool declarations
  * defined here. When Gemini invokes a function, the server executes it against
  * Firestore/Maps and returns the tool result back to Gemini for a final reply.
  */
@@ -12,7 +12,8 @@ import "server-only";
 
 import {
   GoogleGenerativeAI,
-  type GenerativeModel,
+  type Content,
+  type ChatSession,
   type Tool,
   type FunctionDeclaration,
   SchemaType,
@@ -20,112 +21,72 @@ import {
 
 // ─── Client singleton ─────────────────────────────────────────────────────────
 
-let _client: GoogleGenerativeAI | null = null;
+let _client: GoogleGenerativeAI | undefined;
 
 function getGeminiClient(): GoogleGenerativeAI {
   if (_client) return _client;
 
   const apiKey = process.env["GOOGLE_GEMINI_API_KEY"];
   if (!apiKey) {
-    throw new Error(
-      "GOOGLE_GEMINI_API_KEY is not set. Add it to .env.local.",
-    );
+    throw new Error("GOOGLE_GEMINI_API_KEY is not set. Add it to .env.local.");
   }
   _client = new GoogleGenerativeAI(apiKey);
   return _client;
 }
 
-// ─── Model factory ────────────────────────────────────────────────────────────
+export const GEMINI_MODEL = "gemini-2.5-flash";
 
-export const GEMINI_MODEL = "gemini-2.0-flash";
+// ─── System prompt ────────────────────────────────────────────────────────────
 
-/**
- * Return a Gemini model instance pre-configured with:
- * - System instruction describing the GateFlow assistant role
- * - Function declarations for all available tools
- */
-export function getGeminiModel(): GenerativeModel {
-  const client = getGeminiClient();
+const DEFAULT_SYSTEM_PROMPT =
+  "You are GateFlow, a friendly venue entry assistant at a major sporting event. " +
+  "You help attendees find their assigned gate, check wait times, get directions, " +
+  "and stay entertained with trivia while they wait. Be concise, helpful, and " +
+  "upbeat. Always provide specific numbers when discussing wait times.";
 
-  return client.getGenerativeModel({
-    model: GEMINI_MODEL,
-    systemInstruction: `
-You are GateFlow, an intelligent venue entry assistant helping attendees at large
-sporting events (50 000+ capacity). Your goals are:
-1. Assign attendees to the optimal gate based on their seat section and current
-   queue lengths.
-2. Provide real-time wait estimates and walking directions.
-3. Answer questions about the event, venue, and entry process.
+// ─── Function declarations ────────────────────────────────────────────────────
 
-Always be concise, friendly, and proactive. When you call a function, wait for
-the result before replying to the user. Never reveal raw Firestore data — always
-format numbers and durations in plain English.
-    `.trim(),
-    tools: [gateflowTools],
-  });
-}
-
-// ─── Function Declarations ────────────────────────────────────────────────────
-
-const getGateStatusDeclaration: FunctionDeclaration = {
-  name: "getGateStatus",
-  description:
-    "Retrieve live queue length and estimated wait time for a specific gate.",
+const getQueueStatusDeclaration: FunctionDeclaration = {
+  name: "getQueueStatus",
+  description: "Get the current queue length and estimated wait time for a gate",
   parameters: {
     type: SchemaType.OBJECT,
     properties: {
-      eventId: {
-        type: SchemaType.STRING,
-        description: "The Firestore event document ID.",
-      },
       gateId: {
         type: SchemaType.STRING,
-        description: "The gate document ID within the event.",
+        description: "The gate document ID.",
       },
     },
-    required: ["eventId", "gateId"],
+    required: ["gateId"],
   },
 };
 
-const assignGateDeclaration: FunctionDeclaration = {
-  name: "assignGate",
-  description:
-    "Assign the best available gate for an attendee given their ticket barcode. " +
-    "Uses the Power-of-Two-Choices algorithm weighted by proximity.",
+const getDirectionsDeclaration: FunctionDeclaration = {
+  name: "getDirections",
+  description: "Get walking directions from attendee's location to their assigned gate",
   parameters: {
     type: SchemaType.OBJECT,
     properties: {
-      eventId: {
-        type: SchemaType.STRING,
-        description: "The Firestore event document ID.",
+      fromLat: {
+        type: SchemaType.NUMBER,
+        description: "Attendee's current latitude.",
       },
-      barcode: {
+      fromLng: {
+        type: SchemaType.NUMBER,
+        description: "Attendee's current longitude.",
+      },
+      toGateId: {
         type: SchemaType.STRING,
-        description: "The attendee's ticket barcode.",
+        description: "The destination gate document ID.",
       },
     },
-    required: ["eventId", "barcode"],
+    required: ["fromLat", "fromLng", "toGateId"],
   },
 };
 
-const getAllGatesDeclaration: FunctionDeclaration = {
-  name: "getAllGates",
-  description: "Return the status of all active gates for an event.",
-  parameters: {
-    type: SchemaType.OBJECT,
-    properties: {
-      eventId: {
-        type: SchemaType.STRING,
-        description: "The Firestore event document ID.",
-      },
-    },
-    required: ["eventId"],
-  },
-};
-
-const getEventInfoDeclaration: FunctionDeclaration = {
-  name: "getEventInfo",
-  description: "Return basic information about the event (name, start time, venue).",
+const getVenueTriviaDeclaration: FunctionDeclaration = {
+  name: "getVenueTrivia",
+  description: "Get an interesting fact about the teams, venue, or today's matchup",
   parameters: {
     type: SchemaType.OBJECT,
     properties: {
@@ -138,23 +99,61 @@ const getEventInfoDeclaration: FunctionDeclaration = {
   },
 };
 
-/** All tools exposed to the Gemini model. */
-export const gateflowTools: Tool = {
+const requestReassignmentDeclaration: FunctionDeclaration = {
+  name: "requestReassignment",
+  description: "Check if there's a faster gate available and offer to reassign",
+  parameters: {
+    type: SchemaType.OBJECT,
+    properties: {
+      ticketId: {
+        type: SchemaType.STRING,
+        description: "The attendee's ticket document ID.",
+      },
+      currentGateId: {
+        type: SchemaType.STRING,
+        description: "The gate the attendee is currently assigned to.",
+      },
+    },
+    required: ["ticketId", "currentGateId"],
+  },
+};
+
+const assistantTools: Tool = {
   functionDeclarations: [
-    getGateStatusDeclaration,
-    assignGateDeclaration,
-    getAllGatesDeclaration,
-    getEventInfoDeclaration,
+    getQueueStatusDeclaration,
+    getDirectionsDeclaration,
+    getVenueTriviaDeclaration,
+    requestReassignmentDeclaration,
   ],
 };
 
-// ─── Function name constants (used by the chat route handler) ─────────────────
+// ─── Chat session factory ─────────────────────────────────────────────────────
+
+/**
+ * Create a Gemini chat session configured with the four assistant tools.
+ *
+ * @param systemPrompt  Overrides the default GateFlow system prompt.
+ * @param history       Prior conversation turns to reconstruct multi-turn context.
+ */
+export function createChat(
+  systemPrompt: string = DEFAULT_SYSTEM_PROMPT,
+  history: Content[] = [],
+): ChatSession {
+  const model = getGeminiClient().getGenerativeModel({
+    model: GEMINI_MODEL,
+    systemInstruction: systemPrompt,
+    tools: [assistantTools],
+  });
+  return model.startChat({ history });
+}
+
+// ─── Function name constants ──────────────────────────────────────────────────
 
 export const GEMINI_FUNCTIONS = {
-  GET_GATE_STATUS: "getGateStatus",
-  ASSIGN_GATE: "assignGate",
-  GET_ALL_GATES: "getAllGates",
-  GET_EVENT_INFO: "getEventInfo",
+  GET_QUEUE_STATUS:     "getQueueStatus",
+  GET_DIRECTIONS:       "getDirections",
+  GET_VENUE_TRIVIA:     "getVenueTrivia",
+  REQUEST_REASSIGNMENT: "requestReassignment",
 } as const;
 
 export type GeminiFunctionName =

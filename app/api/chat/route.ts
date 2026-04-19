@@ -3,15 +3,15 @@
  *
  * POST /api/chat
  *
- * Handles multi-turn Gemini conversations with function calling.
- * Processes one user message at a time, executes any Gemini-requested
- * function calls against Firestore, and returns the final text response.
+ * Multi-turn Gemini conversation with function calling.
+ * Executes tool calls server-side against Firestore and Google Maps, then
+ * returns Gemini's final natural-language response.
  *
  * Request body:
- *   { eventId: string; history: GeminiMessage[]; message: string }
+ *   { message: string; history: ChatMessage[]; context: { ticketId, gateId, eventId } }
  *
  * Response (200):
- *   { reply: string; history: GeminiMessage[] }
+ *   { reply: string; history: ChatMessage[]; functionResults: FunctionResult[] }
  *
  * Response (400 | 500):
  *   { error: string }
@@ -19,24 +19,73 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import type { Content, Part } from "@google/generative-ai";
-import { getGeminiModel, GEMINI_FUNCTIONS } from "@/lib/gemini";
+import { createChat, GEMINI_FUNCTIONS } from "@/lib/gemini";
 import { getAdminDb } from "@/lib/firebase";
-import { assignGate } from "@/lib/assignment";
+import { assignGate, computeGateScore } from "@/lib/assignment";
 import type { SectionZoneMapping, GateState } from "@/lib/assignment";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type GeminiMessage = Content;
+type ChatMessage = Content;
+
+interface ChatContext {
+  ticketId: string;
+  gateId: string;
+  eventId: string;
+}
 
 interface ChatRequestBody {
-  eventId: string;
-  history: GeminiMessage[];
   message: string;
+  history: ChatMessage[];
+  context: ChatContext;
+}
+
+interface FunctionResult {
+  name: string;
+  result: unknown;
 }
 
 interface ChatResponse {
   reply: string;
-  history: GeminiMessage[];
+  history: ChatMessage[];
+  functionResults: FunctionResult[];
+}
+
+// ─── Shared gate-data loader ──────────────────────────────────────────────────
+
+interface FullGateData {
+  name: string;
+  zoneId: string;
+  lat: number;
+  lng: number;
+  estimatedWaitMinutes: number;
+  queueLength: number;
+  maxThroughputPerMin: number;
+}
+
+async function loadActiveGates(
+  eventId: string,
+): Promise<Map<string, FullGateData>> {
+  const db = getAdminDb();
+  const snapshot = await db
+    .collection(`events/${eventId}/gates`)
+    .where("isActive", "==", true)
+    .get();
+
+  const gateMap = new Map<string, FullGateData>();
+  for (const gateDoc of snapshot.docs) {
+    const rawData = gateDoc.data();
+    gateMap.set(gateDoc.id, {
+      name: rawData["name"] as string,
+      zoneId: rawData["zoneId"] as string,
+      lat: (rawData["lat"] as number) ?? 0,
+      lng: (rawData["lng"] as number) ?? 0,
+      estimatedWaitMinutes: (rawData["estimatedWaitMinutes"] as number) ?? 0,
+      queueLength: (rawData["queueLength"] as number) ?? 0,
+      maxThroughputPerMin: (rawData["maxThroughputPerMin"] as number) ?? 1,
+    });
+  }
+  return gateMap;
 }
 
 // ─── Function executor ────────────────────────────────────────────────────────
@@ -44,85 +93,135 @@ interface ChatResponse {
 async function executeFunctionCall(
   name: string,
   args: Record<string, unknown>,
+  context: ChatContext,
 ): Promise<unknown> {
   const db = getAdminDb();
+  const { eventId } = context;
 
   switch (name) {
-    case GEMINI_FUNCTIONS.GET_GATE_STATUS: {
-      const { eventId, gateId } = args as { eventId: string; gateId: string };
-      const doc = await db.doc(`events/${eventId}/gates/${gateId}`).get();
-      if (!doc.exists) return { error: "Gate not found." };
-      return { gateId, ...doc.data() };
+    // ── getQueueStatus ──────────────────────────────────────────────────────
+    case GEMINI_FUNCTIONS.GET_QUEUE_STATUS: {
+      const { gateId } = args as { gateId: string };
+      const gateDoc = await db.doc(`events/${eventId}/gates/${gateId}`).get();
+      if (!gateDoc.exists) return { error: "Gate not found." };
+      const gateData = gateDoc.data()!;
+      return {
+        gateId,
+        name: gateData["name"],
+        queueLength: gateData["queueLength"] ?? 0,
+        estimatedWaitMinutes: gateData["estimatedWaitMinutes"] ?? 0,
+        isActive: gateData["isActive"] ?? true,
+      };
     }
 
-    case GEMINI_FUNCTIONS.GET_ALL_GATES: {
-      const { eventId } = args as { eventId: string };
-      const snapshot = await db
-        .collection(`events/${eventId}/gates`)
-        .where("isActive", "==", true)
-        .get();
-      return snapshot.docs.map((d) => ({ gateId: d.id, ...d.data() }));
-    }
-
-    case GEMINI_FUNCTIONS.GET_EVENT_INFO: {
-      const { eventId } = args as { eventId: string };
-      const doc = await db.doc(`events/${eventId}`).get();
-      if (!doc.exists) return { error: "Event not found." };
-      return { eventId, ...doc.data() };
-    }
-
-    case GEMINI_FUNCTIONS.ASSIGN_GATE: {
-      const { eventId, barcode } = args as {
-        eventId: string;
-        barcode: string;
+    // ── getDirections ───────────────────────────────────────────────────────
+    case GEMINI_FUNCTIONS.GET_DIRECTIONS: {
+      const { fromLat, fromLng, toGateId } = args as {
+        fromLat: number;
+        fromLng: number;
+        toGateId: string;
       };
 
-      const ticketSnapshot = await db
-        .collection(`events/${eventId}/tickets`)
-        .where("barcode", "==", barcode)
-        .limit(1)
+      const gateDoc = await db.doc(`events/${eventId}/gates/${toGateId}`).get();
+      if (!gateDoc.exists) return { error: "Gate not found." };
+
+      const gateData = gateDoc.data()!;
+      const gateLat = gateData["lat"] as number;
+      const gateLng = gateData["lng"] as number;
+      const gateName = gateData["name"] as string;
+
+      const mapsApiKey = process.env["NEXT_PUBLIC_MAPS_API_KEY"];
+      if (!mapsApiKey) return { error: "Maps API not configured." };
+
+      const directionsUrl = new URL(
+        "https://maps.googleapis.com/maps/api/directions/json",
+      );
+      directionsUrl.searchParams.set("origin", `${fromLat},${fromLng}`);
+      directionsUrl.searchParams.set("destination", `${gateLat},${gateLng}`);
+      directionsUrl.searchParams.set("mode", "walking");
+      directionsUrl.searchParams.set("key", mapsApiKey);
+
+      const mapsResponse = await fetch(directionsUrl.toString());
+      if (!mapsResponse.ok) return { error: "Could not reach Maps API." };
+
+      const directionsData = (await mapsResponse.json()) as {
+        status: string;
+        routes: Array<{
+          legs: Array<{
+            distance: { text: string; value: number };
+            duration: { text: string; value: number };
+          }>;
+          summary: string;
+        }>;
+      };
+
+      if (directionsData.status !== "OK" || !directionsData.routes[0]) {
+        return { error: `Directions unavailable (${directionsData.status}).` };
+      }
+
+      const leg = directionsData.routes[0].legs[0]!;
+      return {
+        gateName,
+        distanceText: leg.distance.text,
+        walkingTimeText: leg.duration.text,
+        walkingTimeMinutes: Math.ceil(leg.duration.value / 60),
+        routeSummary: directionsData.routes[0].summary,
+      };
+    }
+
+    // ── getVenueTrivia ──────────────────────────────────────────────────────
+    case GEMINI_FUNCTIONS.GET_VENUE_TRIVIA: {
+      const triviaSnapshot = await db
+        .collection(`events/${eventId}/trivia`)
         .get();
 
-      if (ticketSnapshot.empty) return { error: "Ticket not found." };
+      if (triviaSnapshot.empty) return { error: "No trivia available." };
 
-      const ticketData = ticketSnapshot.docs[0]!.data();
-      const seatSection = ticketData["seatSection"] as string;
+      const randomIndex = Math.floor(Math.random() * triviaSnapshot.size);
+      const triviaDoc = triviaSnapshot.docs[randomIndex]!;
+      return triviaDoc.data();
+    }
 
+    // ── requestReassignment ─────────────────────────────────────────────────
+    case GEMINI_FUNCTIONS.REQUEST_REASSIGNMENT: {
+      const { ticketId, currentGateId } = args as {
+        ticketId: string;
+        currentGateId: string;
+      };
+
+      // Load ticket to get section
+      const ticketDoc = await db
+        .doc(`events/${eventId}/tickets/${ticketId}`)
+        .get();
+      if (!ticketDoc.exists) return { error: "Ticket not found." };
+
+      const seatSection = ticketDoc.data()!["seatSection"] as string;
+
+      // Load event → venue → section mappings
       const eventDoc = await db.doc(`events/${eventId}`).get();
       const venueId = (eventDoc.data() as Record<string, unknown>)["venueId"] as string;
 
       const sectionDoc = await db
         .doc(`venues/${venueId}/sections/${seatSection}`)
         .get();
-      if (!sectionDoc.exists)
-        return { error: `Section "${seatSection}" not found.` };
+      if (!sectionDoc.exists) return { error: "Section data not found." };
 
       const sectionRaw = sectionDoc.data() as {
         zoneMappings: Array<{ zoneId: string; proximityScore: number }>;
       };
 
-      const gatesSnapshot = await db
-        .collection(`events/${eventId}/gates`)
-        .where("isActive", "==", true)
-        .get();
+      // Load all active gates
+      const gateFullData = await loadActiveGates(eventId);
 
-      const gateFullData = new Map<string, { zoneId: string; queueLength: number; maxThroughputPerMin: number }>();
-      for (const gateDoc of gatesSnapshot.docs) {
-        const rawGateData = gateDoc.data();
-        gateFullData.set(gateDoc.id, {
-          zoneId: rawGateData["zoneId"] as string,
-          queueLength: (rawGateData["queueLength"] as number) ?? 0,
-          maxThroughputPerMin: (rawGateData["maxThroughputPerMin"] as number) ?? 1,
-        });
-      }
-
-      const sectionZoneMappings: SectionZoneMapping[] = sectionRaw.zoneMappings.map((zoneMapping) => ({
-        zoneId: zoneMapping.zoneId,
-        proximityScore: zoneMapping.proximityScore,
-        gateIds: [...gateFullData.entries()]
-          .filter(([, gateEntry]) => gateEntry.zoneId === zoneMapping.zoneId)
-          .map(([gateId]) => gateId),
-      }));
+      const sectionZoneMappings: SectionZoneMapping[] = sectionRaw.zoneMappings.map(
+        (zoneMapping) => ({
+          zoneId: zoneMapping.zoneId,
+          proximityScore: zoneMapping.proximityScore,
+          gateIds: [...gateFullData.keys()].filter(
+            (gateId) => gateFullData.get(gateId)!.zoneId === zoneMapping.zoneId,
+          ),
+        }),
+      );
 
       const gateStates = new Map<string, GateState>(
         [...gateFullData.entries()].map(([gateId, gateEntry]) => [
@@ -131,9 +230,64 @@ async function executeFunctionCall(
         ]),
       );
 
-      const result = assignGate(seatSection, sectionZoneMappings, gateStates);
-      if (!result) return { error: "No eligible gates available." };
-      return result;
+      // Re-run algorithm to find the best available gate
+      const suggestion = assignGate(seatSection, sectionZoneMappings, gateStates);
+
+      if (!suggestion || suggestion.gateId === currentGateId) {
+        const currentGate = gateFullData.get(currentGateId);
+        return {
+          reassignmentAvailable: false,
+          message: "Your current gate already has the shortest wait.",
+          currentGate: {
+            gateId: currentGateId,
+            name: currentGate?.name ?? currentGateId,
+            estimatedWaitMinutes: currentGate?.estimatedWaitMinutes ?? 0,
+          },
+        };
+      }
+
+      // Compare scores to confirm the suggestion is genuinely better
+      const currentGateData = gateFullData.get(currentGateId);
+      const suggestedGateData = gateFullData.get(suggestion.gateId)!;
+
+      // Find proximity score for both gates relative to the attendee's section
+      const findProximityScore = (gateId: string): number => {
+        const gateZoneId = gateFullData.get(gateId)?.zoneId ?? "";
+        const zoneMapping = sectionRaw.zoneMappings.find(
+          (zm) => zm.zoneId === gateZoneId,
+        );
+        return zoneMapping?.proximityScore ?? 0.5;
+      };
+
+      const currentScore = currentGateData
+        ? computeGateScore(
+            { queueLength: currentGateData.queueLength, maxThroughputPerMin: currentGateData.maxThroughputPerMin },
+            findProximityScore(currentGateId),
+          )
+        : Infinity;
+
+      const suggestedScore = computeGateScore(
+        { queueLength: suggestedGateData.queueLength, maxThroughputPerMin: suggestedGateData.maxThroughputPerMin },
+        findProximityScore(suggestion.gateId),
+      );
+
+      if (suggestedScore >= currentScore) {
+        return {
+          reassignmentAvailable: false,
+          message: "Your current gate already has the shortest wait.",
+        };
+      }
+
+      return {
+        reassignmentAvailable: true,
+        suggestedGateId: suggestion.gateId,
+        suggestedGateName: suggestedGateData.name,
+        suggestedWaitMinutes: suggestedGateData.estimatedWaitMinutes,
+        currentWaitMinutes: currentGateData?.estimatedWaitMinutes ?? 0,
+        savedMinutes:
+          (currentGateData?.estimatedWaitMinutes ?? 0) -
+          suggestedGateData.estimatedWaitMinutes,
+      };
     }
 
     default:
@@ -152,61 +306,69 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const { eventId, history, message } = body;
+  const { message, history, context } = body;
 
-  if (!eventId || !message) {
+  if (!message || !context?.eventId) {
     return NextResponse.json(
-      { error: "eventId and message are required." },
+      { error: "message and context.eventId are required." },
       { status: 400 },
     );
   }
 
   try {
-    const model = getGeminiModel();
-    const chat = model.startChat({ history: history ?? [] });
+    const systemPrompt =
+      `You are GateFlow, a friendly venue entry assistant at a major sporting event. ` +
+      `You help attendees find their assigned gate, check wait times, get directions, ` +
+      `and stay entertained with trivia while they wait. Be concise, helpful, and upbeat. ` +
+      `Always provide specific numbers when discussing wait times. ` +
+      `ATTENDEE CONTEXT — event: ${context.eventId}, assigned gate ID: ${context.gateId}, ` +
+      `ticket ID: ${context.ticketId}. ` +
+      `When the attendee asks about their gate or wait time, call getQueueStatus with ` +
+      `gateId="${context.gateId}" immediately — do NOT ask them which gate they are at.`;
 
-    // Send user message
+    const chat = createChat(systemPrompt, history ?? []);
+
     let result = await chat.sendMessage(message);
-    let response = result.response;
+    let geminiResponse = result.response;
+
+    const functionResults: FunctionResult[] = [];
 
     // Agentic loop — keep executing functions until Gemini returns plain text
     while (
-      response.candidates?.[0]?.content?.parts?.some(
-        (p) => "functionCall" in p,
+      geminiResponse.candidates?.[0]?.content?.parts?.some(
+        (part) => "functionCall" in part,
       )
     ) {
       const functionResponseParts: Part[] = [];
 
-      for (const part of response.candidates[0].content.parts) {
+      for (const part of geminiResponse.candidates[0].content.parts) {
         if (!("functionCall" in part) || !part.functionCall) continue;
 
         const { name, args } = part.functionCall;
         const fnResult = await executeFunctionCall(
           name,
           args as Record<string, unknown>,
+          context,
         );
 
+        functionResults.push({ name, result: fnResult });
+
         functionResponseParts.push({
-          functionResponse: {
-            name,
-            response: { result: fnResult },
-          },
+          functionResponse: { name, response: { result: fnResult } },
         });
       }
 
-      // Return function responses to Gemini
       result = await chat.sendMessage(functionResponseParts);
-      response = result.response;
+      geminiResponse = result.response;
     }
 
-    const reply = response.text();
+    const reply = geminiResponse.text();
     const updatedHistory = await chat.getHistory();
 
-    const chatResponse: ChatResponse = { reply, history: updatedHistory };
+    const chatResponse: ChatResponse = { reply, history: updatedHistory, functionResults };
     return NextResponse.json(chatResponse, { status: 200 });
   } catch (error: unknown) {
-    const message =
-      error instanceof Error ? error.message : "Internal server error.";
+    const message = error instanceof Error ? error.message : "Internal server error.";
     console.error("[/api/chat] Error:", error);
     return NextResponse.json({ error: message }, { status: 500 });
   }
