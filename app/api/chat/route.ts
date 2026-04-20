@@ -51,8 +51,6 @@ interface ChatResponse {
   functionResults: FunctionResult[];
 }
 
-// ─── Shared gate-data loader ──────────────────────────────────────────────────
-
 interface FullGateData {
   name: string;
   zoneId: string;
@@ -61,31 +59,62 @@ interface FullGateData {
   estimatedWaitMinutes: number;
   queueLength: number;
   maxThroughputPerMin: number;
+  isActive: boolean;
 }
 
+/** Request-scoped gate cache — eliminates redundant Firestore reads within one agentic loop. */
+type GateCache = Map<string, FullGateData>;
+
+// ─── Gate cache helpers ───────────────────────────────────────────────────────
+
+function rawToGateData(raw: Record<string, unknown>): FullGateData {
+  return {
+    name: raw["name"] as string,
+    zoneId: raw["zoneId"] as string,
+    lat: (raw["lat"] as number) ?? 0,
+    lng: (raw["lng"] as number) ?? 0,
+    estimatedWaitMinutes: (raw["estimatedWaitMinutes"] as number) ?? 0,
+    queueLength: (raw["queueLength"] as number) ?? 0,
+    maxThroughputPerMin: (raw["maxThroughputPerMin"] as number) ?? 1,
+    isActive: (raw["isActive"] as boolean) ?? true,
+  };
+}
+
+/** Returns cached gate data, or fetches from Firestore and writes back on miss. */
+async function getCachedGate(
+  gateId: string,
+  eventId: string,
+  cache: GateCache,
+): Promise<FullGateData | null> {
+  const hit = cache.get(gateId);
+  if (hit) return hit;
+
+  const db = getAdminDb();
+  const snap = await db.doc(`events/${eventId}/gates/${gateId}`).get();
+  if (!snap.exists) return null;
+
+  const gateData = rawToGateData(snap.data() as Record<string, unknown>);
+  cache.set(gateId, gateData);
+  return gateData;
+}
+
+/** Loads all active gates into the cache (skips already-cached entries) and returns it. */
 async function loadActiveGates(
   eventId: string,
-): Promise<Map<string, FullGateData>> {
+  cache: GateCache,
+): Promise<GateCache> {
   const db = getAdminDb();
   const snapshot = await db
     .collection(`events/${eventId}/gates`)
     .where("isActive", "==", true)
     .get();
 
-  const gateMap = new Map<string, FullGateData>();
   for (const gateDoc of snapshot.docs) {
-    const rawData = gateDoc.data();
-    gateMap.set(gateDoc.id, {
-      name: rawData["name"] as string,
-      zoneId: rawData["zoneId"] as string,
-      lat: (rawData["lat"] as number) ?? 0,
-      lng: (rawData["lng"] as number) ?? 0,
-      estimatedWaitMinutes: (rawData["estimatedWaitMinutes"] as number) ?? 0,
-      queueLength: (rawData["queueLength"] as number) ?? 0,
-      maxThroughputPerMin: (rawData["maxThroughputPerMin"] as number) ?? 1,
-    });
+    if (!cache.has(gateDoc.id)) {
+      cache.set(gateDoc.id, rawToGateData(gateDoc.data() as Record<string, unknown>));
+    }
   }
-  return gateMap;
+  return cache;
 }
 
 // ─── Function executor ────────────────────────────────────────────────────────
@@ -94,6 +123,7 @@ async function executeFunctionCall(
   name: string,
   args: Record<string, unknown>,
   context: ChatContext,
+  gateCache: GateCache,
 ): Promise<unknown> {
   const db = getAdminDb();
   const { eventId } = context;
@@ -102,15 +132,14 @@ async function executeFunctionCall(
     // ── getQueueStatus ──────────────────────────────────────────────────────
     case GEMINI_FUNCTIONS.GET_QUEUE_STATUS: {
       const { gateId } = args as { gateId: string };
-      const gateDoc = await db.doc(`events/${eventId}/gates/${gateId}`).get();
-      if (!gateDoc.exists) return { error: "Gate not found." };
-      const gateData = gateDoc.data()!;
+      const gateData = await getCachedGate(gateId, eventId, gateCache);
+      if (!gateData) return { error: "Gate not found." };
       return {
         gateId,
-        name: gateData["name"],
-        queueLength: gateData["queueLength"] ?? 0,
-        estimatedWaitMinutes: gateData["estimatedWaitMinutes"] ?? 0,
-        isActive: gateData["isActive"] ?? true,
+        name: gateData.name,
+        queueLength: gateData.queueLength,
+        estimatedWaitMinutes: gateData.estimatedWaitMinutes,
+        isActive: gateData.isActive,
       };
     }
 
@@ -122,13 +151,8 @@ async function executeFunctionCall(
         toGateId: string;
       };
 
-      const gateDoc = await db.doc(`events/${eventId}/gates/${toGateId}`).get();
-      if (!gateDoc.exists) return { error: "Gate not found." };
-
-      const gateData = gateDoc.data()!;
-      const gateLat = gateData["lat"] as number;
-      const gateLng = gateData["lng"] as number;
-      const gateName = gateData["name"] as string;
+      const gateData = await getCachedGate(toGateId, eventId, gateCache);
+      if (!gateData) return { error: "Gate not found." };
 
       const mapsApiKey = process.env["NEXT_PUBLIC_MAPS_API_KEY"];
       if (!mapsApiKey) return { error: "Maps API not configured." };
@@ -137,7 +161,7 @@ async function executeFunctionCall(
         "https://maps.googleapis.com/maps/api/directions/json",
       );
       directionsUrl.searchParams.set("origin", `${fromLat},${fromLng}`);
-      directionsUrl.searchParams.set("destination", `${gateLat},${gateLng}`);
+      directionsUrl.searchParams.set("destination", `${gateData.lat},${gateData.lng}`);
       directionsUrl.searchParams.set("mode", "walking");
       directionsUrl.searchParams.set("key", mapsApiKey);
 
@@ -161,7 +185,7 @@ async function executeFunctionCall(
 
       const leg = directionsData.routes[0].legs[0]!;
       return {
-        gateName,
+        gateName: gateData.name,
         distanceText: leg.distance.text,
         walkingTimeText: leg.duration.text,
         walkingTimeMinutes: Math.ceil(leg.duration.value / 60),
@@ -171,14 +195,17 @@ async function executeFunctionCall(
 
     // ── getVenueTrivia ──────────────────────────────────────────────────────
     case GEMINI_FUNCTIONS.GET_VENUE_TRIVIA: {
-      const triviaSnapshot = await db
-        .collection(`events/${eventId}/trivia`)
-        .get();
+      const triviaCollection = db.collection(`events/${eventId}/trivia`);
 
-      if (triviaSnapshot.empty) return { error: "No trivia available." };
+      const countSnap = await triviaCollection.count().get();
+      const count = countSnap.data().count;
+      if (count === 0) return { error: "No trivia available." };
 
-      const randomIndex = Math.floor(Math.random() * triviaSnapshot.size);
-      const triviaDoc = triviaSnapshot.docs[randomIndex]!;
+      const offset = Math.floor(Math.random() * count);
+      const triviaSnap = await triviaCollection.offset(offset).limit(1).get();
+      const triviaDoc = triviaSnap.docs[0];
+      if (!triviaDoc) return { error: "No trivia available." };
+
       return triviaDoc.data();
     }
 
@@ -210,8 +237,8 @@ async function executeFunctionCall(
         zoneMappings: Array<{ zoneId: string; proximityScore: number }>;
       };
 
-      // Load all active gates
-      const gateFullData = await loadActiveGates(eventId);
+      // Load all active gates — populates gateCache, avoids re-fetching already-seen gates
+      const gateFullData = await loadActiveGates(eventId, gateCache);
 
       const sectionZoneMappings: SectionZoneMapping[] = sectionRaw.zoneMappings.map(
         (zoneMapping) => ({
@@ -230,7 +257,6 @@ async function executeFunctionCall(
         ]),
       );
 
-      // Re-run algorithm to find the best available gate
       const suggestion = assignGate(seatSection, sectionZoneMappings, gateStates);
 
       if (!suggestion || suggestion.gateId === currentGateId) {
@@ -246,11 +272,9 @@ async function executeFunctionCall(
         };
       }
 
-      // Compare scores to confirm the suggestion is genuinely better
       const currentGateData = gateFullData.get(currentGateId);
       const suggestedGateData = gateFullData.get(suggestion.gateId)!;
 
-      // Find proximity score for both gates relative to the attendee's section
       const findProximityScore = (gateId: string): number => {
         const gateZoneId = gateFullData.get(gateId)?.zoneId ?? "";
         const zoneMapping = sectionRaw.zoneMappings.find(
@@ -328,6 +352,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     const chat = createChat(systemPrompt, history ?? []);
 
+    // One cache per request — shared across all function calls in this agentic loop
+    const gateCache: GateCache = new Map();
+
     let result = await chat.sendMessage(message);
     let geminiResponse = result.response;
 
@@ -349,6 +376,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           name,
           args as Record<string, unknown>,
           context,
+          gateCache,
         );
 
         functionResults.push({ name, result: fnResult });

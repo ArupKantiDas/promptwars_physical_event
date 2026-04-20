@@ -67,6 +67,22 @@ interface Candidate {
 /**
  * Assign a gate using Power-of-Two-Choices with proximity weighting.
  *
+ * **Power-of-Two-Choices** (Mitzenmacher 1996): instead of scanning all eligible
+ * gates and picking the globally least-loaded one — which causes herd oscillation
+ * as every attendee races to the same gate — we randomly sample exactly TWO
+ * candidates and assign to whichever scores lower. This reduces the maximum queue
+ * length from O(log n) (uniform random) to O(log log n) with zero coordination
+ * overhead, meaning load stays near-optimal even when thousands of attendees check
+ * in simultaneously.
+ *
+ * **Proximity weighting**: raw queue length alone ignores walking distance.
+ * Gate N3 may have 5 fewer people but sit on the opposite side of a 50 000-seat
+ * stadium. The score formula `(queueLength / maxThroughputPerMin) * (1 / proximityScore)`
+ * converts queue depth into *estimated wait minutes* and then scales it by how far
+ * the attendee has to walk — a gate with proximityScore 0.5 effectively doubles its
+ * apparent wait, so a nearby gate (score 0.9) is only overridden when it is
+ * substantially more congested.
+ *
  * @param seatSection         The attendee's section ID.
  * @param sectionZoneMappings Zone-to-gate mappings with proximity scores and gate IDs.
  * @param gateStates          Live queue state keyed by gateId.
