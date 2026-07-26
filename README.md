@@ -2,6 +2,12 @@
 
 An AI-powered assistant for crowd entry management at large sporting venues (50,000+ capacity). GateFlow assigns attendees to the fastest available gate, shows live wait times, and gives walking directions, all through a chat interface.
 
+## Project links
+
+- **Decision-led case study:** [Why GateFlow routes with code before the model responds](https://arupdas.com/work/gateflow-context-routing?utm_source=github&utm_medium=referral&utm_campaign=decision_series)
+- **LinkedIn decision post:** [The context-routing decisions behind GateFlow](https://www.linkedin.com/feed/update/urn:li:activity:7451702281625845760/)
+- **Live demo:** [Try GateFlow](https://gateflow-pi.vercel.app/)
+
 ## Chosen Vertical
 
 **Live Event Operations** -- specifically, crowd entry management at large sporting venues.
